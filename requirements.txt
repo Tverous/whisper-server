@@ -1,11 +1,10 @@
-ctranslate2==4.4.0
-faster-whisper
-
-
-
-
-
+openai-whisper
 fastapi
 uvicorn
 aiohttp
 soundfile
+librosa
+python-multipart
+pytest 
+pytest-asyncio
+httpx
