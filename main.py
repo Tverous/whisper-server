@@ -76,7 +76,7 @@ class WhisperProcessor:
                 compression_ratio_threshold=2.4,
                 logprob_threshold=-1.0,
                 no_speech_threshold=0.6,
-                condition_on_previous_text=True,
+                condition_on_previous_text=False,
                 temperature=0.0  # Reduce randomness in output
             )
             
@@ -131,296 +131,282 @@ class WhisperProcessor:
         except Exception as e:
             logger.error(f"Error in voice activity detection: {str(e)}")
             return False
-
-# StreamingSession class modifications
 class StreamingSession:
-    def __init__(self, processor: WhisperProcessor, config: AudioConfig):
+    def __init__(self, processor, config):
         self.processor = processor
         self.config = config
         
-        # Audio buffer for current chunk accumulation
-        self.buffer = np.array([], dtype=np.float32)
+        # -------------------------
+        # SLIDING WINDOW SETTINGS
+        # -------------------------
+        self.SLIDING_WINDOW_SEC = 10.0  # total window size in seconds
+        self.MIN_TRANSCIBE_WINDOW_SEC = 1.0  # min audio needed before we transcribe
+        self.sample_rate = self.config.sample_rate
         
-        # State tracking
+        # Convert durations to # of samples
+        self.SLIDING_WINDOW_SAMPLES = int(self.SLIDING_WINDOW_SEC * self.sample_rate)
+        self.MIN_TRANSCIBE_WINDOW_SAMPLES = int(self.MIN_TRANSCIBE_WINDOW_SEC * self.sample_rate)
+        
+        # Rolling buffer that always holds last ~3s of audio
+        self.sliding_window_buffer = np.array([], dtype=np.float32)
+        
+        # For voice activity detection
         self.is_speaking = False
         self.last_voice_timestamp = 0
-        
-        # --- Buffer size thresholds ---
-        self.MIN_CHUNK_SIZE = int(0.5 * self.config.sample_rate)   # 0.5 s
-        self.OPTIMAL_CHUNK_SIZE = int(2.0 * self.config.sample_rate)  # 2 s
-        self.MAX_CHUNK_SIZE = int(10.0 * self.config.sample_rate)     # 10 s
         
         # Confidence thresholds
         self.MIN_CONFIDENCE_THRESHOLD = 0.6
         self.HIGH_CONFIDENCE_THRESHOLD = 0.8
         
-        # Tracks the **highest-confidence** partial result so far
-        self.last_result = None
-        self.last_confidence = 0.0
+        # Best partial result from the current utterance
+        self.last_partial_text = ""
+        self.last_partial_confidence = 0.0
         
-        # Fully accumulated text and segments across multiple chunks
+        # Final, accumulated transcript across all utterances
         self.accumulated_text = ""
-        self.accumulated_segments = []
+        
+        # States for controlling finalization
+        self.currently_in_utterance = False
     
-    def get_buffer_length(self) -> int:
-        """Get current buffer length in samples."""
-        return len(self.buffer)
-
-    def calculate_confidence(self, result: Dict[str, Any]) -> float:
-        """Calculate confidence score based on multiple factors."""
-        try:
-            # Extract segment confidences from Whisper results
-            segment_confidences = []
-            for segment in result.get("segments", []):
-                avg_logprob = segment.get("avg_logprob", -1)
-                no_speech_prob = segment.get("no_speech_prob", 0)
-                
-                # Convert log prob to probability
-                conf = np.exp(avg_logprob)
-                conf *= (1.0 - no_speech_prob)
-                segment_confidences.append(conf)
-
-            # Average across segments
-            avg_confidence = (
-                sum(segment_confidences) / len(segment_confidences)
-                if segment_confidences else 0.0
-            )
-            
-            # Text length factor
-            text = result.get("text", "").strip()
-            text_length_factor = min(len(text.split()) / 3, 1.0)
-            
-            # Simple penalties
-            has_ellipsis = "..." in text
-            has_question_marks = "???" in text
-            has_repeated_chars = any(c * 3 in text for c in text)
-            penalties = sum([
-                0.2 if has_ellipsis else 0,
-                0.2 if has_question_marks else 0,
-                0.2 if has_repeated_chars else 0
-            ])
-            
-            # Combine
-            confidence = (avg_confidence * 0.8 + text_length_factor * 0.2) * (1.0 - penalties)
-            return max(0.0, min(1.0, confidence))
-            
-        except Exception as e:
-            logger.error(f"Error calculating confidence: {str(e)}")
-            return 0.0
-
+    def _append_to_sliding_window(self, audio_data: np.ndarray):
+        """
+        Add new samples to the sliding window and trim if over capacity.
+        """
+        # Append
+        if len(self.sliding_window_buffer) == 0:
+            self.sliding_window_buffer = audio_data
+        else:
+            self.sliding_window_buffer = np.concatenate([self.sliding_window_buffer, audio_data])
+        
+        # Trim if we exceed the target window size
+        overflow = len(self.sliding_window_buffer) - self.SLIDING_WINDOW_SAMPLES
+        if overflow > 0:
+            self.sliding_window_buffer = self.sliding_window_buffer[overflow:]
+    
     async def process_chunk(self, chunk: bytes) -> Dict[str, Any]:
         """
-        Process an incoming audio chunk:
-          1) Accumulate audio in a buffer.
-          2) Check if we should run transcription (size/time-based or silence).
-          3) Compare new transcription confidence to previous:
-             - If new is higher, replace the old.
-             - If old is higher, keep old.
-          4) If voice ended, finalize text and reset.
+        Processes the latest chunk by:
+          1) Converting to float32 and normalizing
+          2) Checking voice activity
+          3) Appending to the sliding window
+          4) Possibly transcribing the last ~3s
+          5) Doing a simple alignment with previous partial
         """
         try:
-            # Handle end of stream
+            # If chunk is empty => end of stream
             if not chunk:
-                # If there's leftover audio, transcribe it
-                if self.get_buffer_length() >= self.MIN_CHUNK_SIZE:
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        self.processor.transcribe_sync,
-                        self.buffer
-                    )
-                    # This final chunk result is likely high confidence 
-                    return self._prepare_final_result(result, finalize=True)
-                
-                # If too small leftover, finalize with whatever we have
-                return {
-                    "type": "final",
-                    "text": self.accumulated_text,
-                    "segments": self.accumulated_segments,
-                    "is_speaking": False
-                }
-
-            # Convert chunk to float32 in [-1,1]
-            audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-            if np.abs(audio_data).max() > 1.0:
-                audio_data /= 32768.0
-
-            # Check voice activity
-            has_speech = self.processor.check_voice_activity(audio_data)
+                logger.info("Received end-of-stream, finalizing.")
+                return await self._finalize_transcription()
+            
+            # Convert chunk to float32 [-1, 1]
+            new_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            if np.abs(new_data).max() > 1.0:
+                new_data /= 32768.0
+            
+            # Check VAD
+            has_speech = self.processor.check_voice_activity(new_data)
             current_time = time.time()
-
-            # Update speaking state
+            
             if has_speech:
                 self.is_speaking = True
                 self.last_voice_timestamp = current_time
+                self.currently_in_utterance = True
             else:
-                # If silence is enough to consider speech ended
+                # If silent for > silence_duration, consider user has stopped talking
                 if (current_time - self.last_voice_timestamp) > self.config.silence_duration:
                     self.is_speaking = False
             
-            # Accumulate data
-            self.buffer = np.concatenate([self.buffer, audio_data]) \
-                          if len(self.buffer) > 0 else audio_data
+            # Append to the sliding window
+            self._append_to_sliding_window(new_data)
             
-            current_buffer_length = self.get_buffer_length()
-
-            # Condition for a forced transcription
-            should_process = (
-                current_buffer_length >= self.MAX_CHUNK_SIZE or
-                (current_buffer_length >= self.OPTIMAL_CHUNK_SIZE and not self.is_speaking) or
-                (current_buffer_length >= self.MIN_CHUNK_SIZE and
-                 not self.is_speaking and
-                 (current_time - self.last_voice_timestamp) > self.config.silence_duration * 2)
-            )
-
-            if should_process:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.processor.transcribe_sync,
-                    self.buffer
-                )
-                current_confidence = self.calculate_confidence(result)
-                logger.info(f"New transcription confidence: {current_confidence:.2f}")
-
-                # Compare vs. previously stored best result
-                if self.last_result:
-                    if current_confidence > self.last_confidence:
-                        # Replace with better new result
-                        logger.info("New chunk is more confident, replacing old partial result.")
-                        self.last_result = result
-                        self.last_confidence = current_confidence
-                    else:
-                        # Keep old
-                        logger.info("Old chunk result had higher confidence, keeping it.")
-                        result = self.last_result  # we revert to old
-                else:
-                    # No previous result => store new
-                    self.last_result = result
-                    self.last_confidence = current_confidence
-
-                # If confidence is too low, keep buffering unless we reached max
-                if (current_confidence < self.MIN_CONFIDENCE_THRESHOLD
-                        and current_buffer_length < self.MAX_CHUNK_SIZE):
-                    return {
-                        "type": "buffering",
-                        "is_speaking": self.is_speaking,
-                        "buffer_size": current_buffer_length,
-                        "confidence": current_confidence
-                    }
+            # Decide if we should run transcription
+            # We only transcribe if we have at least a min length & (time-based or event-based)
+            window_len = len(self.sliding_window_buffer)
+            if window_len >= self.MIN_TRANSCIBE_WINDOW_SAMPLES:
                 
-                # Voice ended => finalize
-                if not self.is_speaking:
-                    final_data = self._prepare_final_result(self.last_result, finalize=True)
-                    self._reset_streaming_state()  # Clear buffers & state
-                    return final_data
-                else:
-                    # We are still speaking => partial
-                    # Update accumulated text with the best partial
-                    self._update_accumulated_text(self.last_result, self.last_confidence)
-                    
-                    # Reset buffer after we used it for partial
-                    self.buffer = np.array([], dtype=np.float32)
-                    
-                    return self._prepare_partial_result(self.last_result)
-
-            # Otherwise, keep buffering
+                # For demonstration, we will transcribe:
+                #   1) if the user is not speaking now AND we have enough silence
+                #   2) or if the window is "full"
+                #   3) or if we haven't transcribed in a while
+                should_transcribe = False
+                
+                # Condition 1: user just went silent
+                if not self.is_speaking and self.currently_in_utterance:
+                    # If user was speaking but now is silent for a certain period,
+                    # let's transcribe the last window
+                    quiet_time = current_time - self.last_voice_timestamp
+                    if quiet_time >= (self.config.silence_duration * 2):
+                        should_transcribe = True
+                        
+                # Condition 2: The window is "full"
+                if window_len == self.SLIDING_WINDOW_SAMPLES:
+                    should_transcribe = True
+                
+                # If condition triggered => transcribe
+                if should_transcribe:
+                    return await self._sliding_window_transcribe(finalize=not self.is_speaking)
+            
+            # If we are not transcribing yet, return partial “buffering” info
             return {
                 "type": "buffering",
-                "is_speaking": self.is_speaking,
-                "buffer_size": current_buffer_length
+                "text": self.last_partial_text,
+                "accumulated_text": self.accumulated_text,
+                "is_speaking": self.is_speaking
             }
-
-        except Exception as e:
-            logger.error(f"Error processing chunk: {str(e)}")
-            raise
-
-    def _reset_streaming_state(self):
-        """Reset entire streaming state after finalizing or stopping."""
-        self.buffer = np.array([], dtype=np.float32)
-        self.last_result = None
-        self.last_confidence = 0.0
-        self.is_speaking = False
-
-    def _update_accumulated_text(self, result: Dict[str, Any], confidence: float) -> None:
-        """Add the new text to our global accumulation if it is not redundant."""
-        text = result.get("text", "").strip()
-        segments = result.get("segments", [])
         
-        # For high confidence, add it directly
-        if confidence >= self.HIGH_CONFIDENCE_THRESHOLD:
-            self.accumulated_text = (self.accumulated_text + " " + text).strip()
-            self.accumulated_segments.extend(segments)
-        else:
-            # For lower confidence, check redundancy to avoid spamming
-            if text and not self._is_redundant_text(text):
-                self.accumulated_text = (self.accumulated_text + " " + text).strip()
-                self.accumulated_segments.extend(segments)
-
-    def _is_redundant_text(self, new_text: str) -> bool:
-        """Check if new_text is mostly overlapping with accumulated_text."""
-        new_words = set(new_text.lower().split())
-        accumulated_words = set(self.accumulated_text.lower().split())
-        overlap = len(new_words.intersection(accumulated_words))
-        # If >70% overlap => redundant
-        return (len(new_words) > 0 and overlap / len(new_words) > 0.7)
+        except Exception as e:
+            logger.error(f"process_chunk error: {e}")
+            raise
     
-    def _prepare_partial_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Return a partial result structure after each chunk if still speaking."""
-        return {
-            "type": "partial",
-            "text": result.get("text", ""),
-            "segments": result.get("segments", []),
-            "language": result.get("language"),
-            "is_speaking": self.is_speaking,
-            "confidence": self.last_confidence
-        }
-
-    def _prepare_final_result(self, result: Dict[str, Any], finalize=False) -> Dict[str, Any]:
-        """Prepare a final result message, optionally finalizing all text."""
+    async def _sliding_window_transcribe(self, finalize: bool = False) -> Dict[str, Any]:
+        """
+        Transcribes the last ~3s from `sliding_window_buffer`,
+        compares to old partial, merges if better, 
+        optionally finalizes if user has stopped speaking.
+        """
+        # Copy the current buffer for transcription
+        audio_to_transcribe = np.copy(self.sliding_window_buffer)
+        
+        # In practice, you might want to do overlap with more 
+        # than 3s or crossfade; for now, we do a direct pass.
+        result = await self._run_whisper_transcribe(audio_to_transcribe)
+        
+        # Compare confidence
+        current_confidence = self._calculate_confidence(result)
+        logger.info(f"Sliding window transcription confidence: {current_confidence:.2f}")
+        
+        # If new is better, replace partial text. If not, keep old partial.
+        if current_confidence > self.last_partial_confidence:
+            self.last_partial_text = result.get("text", "").strip()
+            self.last_partial_confidence = current_confidence
+        
+        # If finalizing (user silence), we merge the partial text into the accumulated text
         if finalize:
-            # Merge last chunk's text into the accumulated text one last time
-            if result:
-                self._update_accumulated_text(result, self.last_confidence)
+            # Merge last partial to final text
+            self._merge_into_accumulated(self.last_partial_text)
             
-            return {
+            # Reset partial states
+            final_result = {
                 "type": "final",
                 "text": self.accumulated_text,
-                "segments": self.accumulated_segments,
-                "language": result.get("language") if result else None,
-                "is_speaking": False,
-                "confidence": self.last_confidence
+                "segments": [],  # you can fill this with more detail
+                "confidence": self.last_partial_confidence
             }
+            
+            self._reset_utterance_state()
+            logger.info("Finalized transcription after silence.")
+            return final_result
         else:
-            # Return the chunk's final info but not finalize the entire conversation
-            return {
+            # Return partial result but do not finalize
+            partial_result = {
                 "type": "partial",
-                "text": result.get("text", ""),
-                "segments": result.get("segments", []),
-                "language": result.get("language"),
-                "is_speaking": self.is_speaking,
-                "confidence": self.last_confidence
+                "partial_text": self.last_partial_text,
+                "accumulated_text": self.accumulated_text,
+                "confidence": self.last_partial_confidence
             }
-
+            return partial_result
+    
+    async def _finalize_transcription(self) -> Dict[str, Any]:
+        """
+        Called when the stream is ended or forcibly closed:
+        - We'll do one last transcription if needed
+        - Then finalize everything
+        """
+        # If we have enough samples in the buffer to transcribe, do it
+        if len(self.sliding_window_buffer) >= self.MIN_TRANSCIBE_WINDOW_SAMPLES:
+            result = await self._run_whisper_transcribe(self.sliding_window_buffer)
+            final_conf = self._calculate_confidence(result)
+            if final_conf > self.last_partial_confidence:
+                self.last_partial_text = result.get("text", "").strip()
+                self.last_partial_confidence = final_conf
+        
+        # Merge partial into final
+        self._merge_into_accumulated(self.last_partial_text)
+        
+        final_result = {
+            "type": "final",
+            "text": self.accumulated_text,
+            "segments": [],
+            "confidence": self.last_partial_confidence
+        }
+        self._reset_utterance_state()
+        return final_result
+    
+    def _merge_into_accumulated(self, new_text: str):
+        """
+        Minimal text overlap check to avoid repeating partial words.
+        A more advanced approach might do partial alignment.
+        """
+        if not new_text:
+            return
+        
+        # Example logic: if the new text is mostly repeated in
+        # the last 10 words of accumulated_text, skip or partial-merge.
+        last_10_words = " ".join(self.accumulated_text.lower().split()[-10:])
+        new_words = new_text.lower().split()
+        
+        overlap = sum(1 for w in new_words if w in last_10_words)
+        # If overlap is too big, we skip. Otherwise, we append.
+        if len(new_words) > 0 and overlap / len(new_words) > 0.7:
+            logger.debug("Detected large overlap; minimal text appended.")
+        else:
+            self.accumulated_text = (self.accumulated_text + " " + new_text).strip()
+    
+    def _reset_utterance_state(self):
+        """
+        Reset states after finishing an utterance, so we can start fresh.
+        """
+        self.sliding_window_buffer = np.array([], dtype=np.float32)
+        self.last_partial_text = ""
+        self.last_partial_confidence = 0.0
+        self.currently_in_utterance = False
+        self.is_speaking = False
+    
     async def end_session(self) -> Dict[str, Any]:
         """
-        Called at websocket close or whenever we want to finalize
-        any leftover data in the buffer.
+        If the websocket or stream ends abruptly, finalize transcription.
         """
-        if self.get_buffer_length() >= self.MIN_CHUNK_SIZE:
-            # Transcribe leftover
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                self.processor.transcribe_sync,
-                self.buffer
-            )
-            return self._prepare_final_result(result, finalize=True)
-        else:
-            # Nothing leftover or too small
-            return {
-                "type": "final",
-                "text": self.accumulated_text,
-                "segments": self.accumulated_segments,
-                "is_speaking": False
-            }
+        return await self._finalize_transcription()
+    
+    # -------------------------------------------
+    # HELPER METHODS
+    # -------------------------------------------
+    async def _run_whisper_transcribe(self, audio_data: np.ndarray) -> Dict[str, Any]:
+        """
+        Offload the synchronous transcribe call to a thread executor
+        to avoid blocking the event loop.
+        """
+        loop = torch._C._get_tracing_state() or None
+        # If using normal python, do:
+        # loop = asyncio.get_event_loop() 
+        return await (loop or asyncio.get_event_loop()).run_in_executor(
+            None,
+            self.processor.transcribe_sync,
+            audio_data
+        )
+    
+    def _calculate_confidence(self, result: Dict[str, Any]) -> float:
+        """
+        Compute an approximate confidence from the Whisper result.
+        You can use your existing method or more advanced logic here.
+        """
+        segments = result.get("segments", [])
+        if not segments:
+            return 0.0
+        
+        # Example: average of exponential(logprob)
+        conf_values = []
+        for seg in segments:
+            avg_lp = seg.get("avg_logprob", -2.0)
+            no_speech = seg.get("no_speech_prob", 0.0)
+            # Convert log prob to [0..1], penalize no_speech
+            seg_conf = np.exp(avg_lp) * (1.0 - no_speech)
+            conf_values.append(seg_conf)
+        
+        if not conf_values:
+            return 0.0
+        
+        return float(np.mean(conf_values))
 
 
 # API Models
