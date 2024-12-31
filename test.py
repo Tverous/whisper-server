@@ -1,5 +1,5 @@
 import numpy as np
-from faster_whisper import WhisperModel
+import whisper
 import torch
 import torch.nn as nn
 from typing import Generator, List, Optional, Union, Callable
@@ -28,39 +28,24 @@ class AudioConfig:
         self.realtime_updates = realtime_updates
         self.update_interval = update_interval
 
-class FasterWhisperStreamingClient:
+class WhisperStreamingClient:
     def __init__(self, 
                  model_name: str = "base",
                  audio_config: Optional[AudioConfig] = None,
                  device: Optional[str] = "cuda",
-                 compute_type: str = "float32",
-                 cpu_threads: int = 4,
                  on_recording_start: Optional[Callable] = None,
                  on_recording_stop: Optional[Callable] = None,
                  on_realtime_transcription_update: Optional[Callable] = None):
         
-        self.device = "cuda" if self.device == "cuda" and torch.cuda.is_available() else "cpu"
-        if self.device == "cpu":
-            compute_type = "float32"
+        self.device = "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         
         try:
-            self.model = WhisperModel(
-                model_size_or_path=model_name,
-                device=self.device,
-                compute_type=compute_type,
-                cpu_threads=cpu_threads
-            )
+            self.model = whisper.load_model(model_name).to(self.device)
         except Exception as e:
             print(f"Error loading Whisper model: {e}")
-            print("Falling back to CPU with float32")
+            print("Falling back to CPU")
             self.device = "cpu"
-            compute_type = "float32"
-            self.model = WhisperModel(
-                model_size_or_path=model_name,
-                device="cpu",
-                compute_type="float32",
-                cpu_threads=cpu_threads
-            )
+            self.model = whisper.load_model(model_name).to(self.device)
 
         self.audio_config = audio_config or AudioConfig()
         
@@ -93,7 +78,7 @@ class FasterWhisperStreamingClient:
         self._last_update_time = 0
         self._current_segment = ""
         
-        print(f"Initialized with device: {self.device}, compute type: {compute_type}")
+        print(f"Initialized with device: {self.device}")
         if self.audio_config.realtime_updates:
             print(f"Real-time updates enabled with {self.audio_config.update_interval}s interval")
 
@@ -158,7 +143,6 @@ class FasterWhisperStreamingClient:
                         self.on_transcription_update(result)
                     yield result
                 except Queue.Empty:
-                    # Check if processing is complete
                     if not self._processing_thread.is_alive():
                         break
                     continue
@@ -209,26 +193,25 @@ class FasterWhisperStreamingClient:
                     print(f"Error processing final chunk: {e}")
         
         finally:
-            # Signal that processing is complete
             self._stop_flag.set()
 
     def _transcribe_chunk(self, audio_chunk: np.ndarray, is_final: bool = True) -> dict:
         try:
-            segments, info = self.model.transcribe(
+            # Whisper expects audio in the shape (n_samples,)
+            result = self.model.transcribe(
                 audio_chunk,
-                beam_size=5,
-                word_timestamps=True,
-                vad_filter=True
+                language=None,  # Let Whisper detect the language
+                task="transcribe",
+                fp16=False if self.device == "cpu" else True
             )
             
             text_segments = []
-            for segment in segments:
+            for segment in result["segments"]:
                 text_segments.append({
-                    'text': segment.text,
-                    'start': segment.start,
-                    'end': segment.end,
-                    'words': [{'word': word.word, 'start': word.start, 'end': word.end} 
-                             for word in segment.words]
+                    'text': segment['text'],
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'words': []  # Whisper doesn't provide word-level timestamps by default
                 })
             
             if text_segments:
@@ -237,7 +220,7 @@ class FasterWhisperStreamingClient:
             return {
                 'type': 'partial' if not is_final else 'final',
                 'segments': text_segments,
-                'language': info.language,
+                'language': result.get('language', 'unknown'),
                 'timestamp': time.time(),
                 'is_speaking': self._is_speaking,
                 'current_segment': self._current_segment
@@ -255,9 +238,8 @@ class FasterWhisperStreamingClient:
         """Stop the streaming process and cleanup."""
         self._stop_flag.set()
         if self._processing_thread and self._processing_thread.is_alive():
-            self._processing_thread.join(timeout=5.0)  # Wait up to 5 seconds
+            self._processing_thread.join(timeout=5.0)
             
-        # Clear any remaining items in the queue
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -283,14 +265,13 @@ def main():
     config = AudioConfig(
         sample_rate=16000,
         channels=1,
-        realtime_updates=False,  # Set to False for regular mode
+        realtime_updates=False,
         update_interval=0.5
     )
     
-    client = FasterWhisperStreamingClient(
+    client = WhisperStreamingClient(
         model_name="base",
         audio_config=config,
-        compute_type="float32",
         on_recording_start=on_recording_start,
         on_recording_stop=on_recording_stop,
         on_realtime_transcription_update=on_transcription_update
@@ -299,8 +280,7 @@ def main():
     def audio_generator(file_path):
         chunk_size = 1600 if config.realtime_updates else 32000
         with open(file_path, 'rb') as audio_file:
-            # while chunk := audio_file.read(chunk_size):
-            for chunk in iter(lambda: audio_file.read(chunk_size), b''):
+            while chunk := audio_file.read(chunk_size):
                 yield chunk
     
     # Start streaming

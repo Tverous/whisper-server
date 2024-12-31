@@ -1,4 +1,11 @@
-numpy
-torch
-torchaudio
+ctranslate2==4.4.0
 faster-whisper
+
+
+
+
+
+fastapi
+uvicorn
+aiohttp
+soundfile
