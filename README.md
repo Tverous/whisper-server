@@ -124,7 +124,7 @@ You can stream audio and get real-time transcriptions over a WebSocket connectio
 #### WebSocket URL
 - **URL**: `/v1/stream`
 
-#### Example using `curl` (using `websocat` or similar WebSocket client)
+#### Example using `websocat`
 ```bash
 websocat ws://localhost:8000/v1/stream
 ```
@@ -244,10 +244,3 @@ Example:
   "accumulated_text": "Hello, this is a test transcription."
 }
 ```
-
----
-
-## Conclusion
-
-This API offers both batch and real-time transcription capabilities, ideal for applications that require speech-to-text conversion, such as voice assistants, transcription services, or audio-based data processing.
-
