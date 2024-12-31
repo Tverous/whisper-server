@@ -132,11 +132,13 @@ class WhisperProcessor:
             logger.error(f"Error in voice activity detection: {str(e)}")
             return False
 
+# StreamingSession class modifications
 class StreamingSession:
     def __init__(self, processor: WhisperProcessor, config: AudioConfig):
         self.processor = processor
         self.config = config
         self.buffer = np.array([], dtype=np.float32)
+        self.prev_buffer = np.array([], dtype=np.float32)  # Store previous buffer
         self.is_speaking = False
         self.last_voice_timestamp = 0
         
@@ -148,48 +150,62 @@ class StreamingSession:
         # Confidence thresholds
         self.MIN_CONFIDENCE_THRESHOLD = 0.6
         self.HIGH_CONFIDENCE_THRESHOLD = 0.8
-        self.last_transcription = None
+        
+        # Track previous results
+        self.last_result = None
+        self.last_confidence = 0.0
+        self.accumulated_text = ""
+        self.accumulated_segments = []
         
     def get_buffer_length(self) -> int:
-        return len(self.buffer) if self.buffer is not None else 0
+        """Get current buffer length in samples."""
+        return len(self.buffer)
         
     def calculate_confidence(self, result: Dict[str, Any]) -> float:
         """Calculate confidence score based on multiple factors."""
         try:
-            # Get average segment confidence if available
-            segment_confidences = [
-                segment.get("confidence", 0.0) 
-                for segment in result.get("segments", [])
-            ]
+            # Extract segment confidences directly from Whisper results
+            segment_confidences = []
+            for segment in result.get("segments", []):
+                # Convert log probability to confidence score
+                avg_logprob = segment.get("avg_logprob", -1)
+                no_speech_prob = segment.get("no_speech_prob", 0)
+                
+                # Calculate segment confidence
+                conf = np.exp(avg_logprob)  # Convert log prob to probability
+                conf *= (1.0 - no_speech_prob)  # Reduce confidence if high no_speech_prob
+                segment_confidences.append(conf)
+            
+            # Calculate average confidence
             avg_confidence = sum(segment_confidences) / len(segment_confidences) if segment_confidences else 0.0
             
-            # Get text length factor (longer text usually means better transcription)
+            # Get text length factor
             text = result.get("text", "").strip()
-            text_length_factor = min(len(text.split()) / 3, 1.0)  # Normalize by expecting at least 3 words
+            text_length_factor = min(len(text.split()) / 3, 1.0)
             
-            # Check for common low-confidence indicators
+            # Check for quality indicators
             has_ellipsis = "..." in text
             has_question_marks = "???" in text
             has_repeated_chars = any(c * 3 in text for c in text)
             
-            # Penalize confidence for low-quality indicators
+            # Apply penalties
             penalties = sum([
                 0.2 if has_ellipsis else 0,
                 0.2 if has_question_marks else 0,
                 0.2 if has_repeated_chars else 0
             ])
             
-            # Combine factors
-            confidence = (avg_confidence * 0.7 + text_length_factor * 0.3) * (1.0 - penalties)
+            # Combine factors with higher weight on Whisper's confidence
+            confidence = (avg_confidence * 0.8 + text_length_factor * 0.2) * (1.0 - penalties)
             
             return max(0.0, min(1.0, confidence))
             
         except Exception as e:
             logger.error(f"Error calculating confidence: {str(e)}")
             return 0.0
-        
+            
     async def process_chunk(self, chunk: bytes) -> Dict[str, Any]:
-        """Process an incoming audio chunk."""
+        """Process an incoming audio chunk with improved accuracy checking."""
         try:
             # Handle end of stream
             if not chunk:
@@ -200,14 +216,10 @@ class StreamingSession:
                         self.buffer
                     )
                     self.buffer = np.array([], dtype=np.float32)
-                    return {
-                        "type": "final",
-                        **result,
-                        "is_speaking": False
-                    }
-                return {"type": "final", "text": "", "is_speaking": False}
+                    return self._prepare_final_result(result)
+                return {"type": "final", "text": self.accumulated_text, "is_speaking": False}
             
-            # Convert bytes to numpy array and normalize
+            # Convert and normalize audio data
             audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             if np.abs(audio_data).max() > 1.0:
                 audio_data = audio_data / 32768.0
@@ -216,28 +228,25 @@ class StreamingSession:
             has_speech = self.processor.check_voice_activity(audio_data)
             current_time = time.time()
             
+            # Update speaking state
             if has_speech:
                 self.is_speaking = True
                 self.last_voice_timestamp = current_time
             elif current_time - self.last_voice_timestamp > self.config.silence_duration:
                 self.is_speaking = False
             
-            # Accumulate the buffer
+            # Accumulate buffer
             if self.buffer is None:
                 self.buffer = audio_data
             else:
                 self.buffer = np.concatenate([self.buffer, audio_data])
             
             current_buffer_length = self.get_buffer_length()
-            logger.debug(f"Current buffer size: {current_buffer_length} samples")
             
             # Check if we should process the buffer
             should_process = (
-                # Process if buffer is too large
                 current_buffer_length >= self.MAX_CHUNK_SIZE or
-                # Process if we have optimal size and speech ended
                 (current_buffer_length >= self.OPTIMAL_CHUNK_SIZE and not self.is_speaking) or
-                # Process if we have minimum size and long silence
                 (current_buffer_length >= self.MIN_CHUNK_SIZE and 
                  not self.is_speaking and 
                  current_time - self.last_voice_timestamp > self.config.silence_duration * 2)
@@ -251,27 +260,40 @@ class StreamingSession:
                     self.buffer
                 )
                 
-                confidence = self.calculate_confidence(result)
-                logger.info(f"Transcription confidence: {confidence:.2f}")
+                # Calculate confidence
+                current_confidence = self.calculate_confidence(result)
+                logger.info(f"Current transcription confidence: {current_confidence:.2f}")
+                
+                # If we have a previous result, compare confidences
+                if self.last_result and self.last_confidence > current_confidence:
+                    # Keep previous result if it had higher confidence
+                    logger.info("Keeping previous higher confidence result")
+                    result = self.last_result
+                    current_confidence = self.last_confidence
+                
+                # Update tracking variables
+                self.last_result = result
+                self.last_confidence = current_confidence
                 
                 # If confidence is too low and buffer isn't too large, continue accumulating
-                if confidence < self.MIN_CONFIDENCE_THRESHOLD and current_buffer_length < self.MAX_CHUNK_SIZE:
+                if current_confidence < self.MIN_CONFIDENCE_THRESHOLD and current_buffer_length < self.MAX_CHUNK_SIZE:
                     return {
                         "type": "buffering",
                         "is_speaking": self.is_speaking,
                         "buffer_size": current_buffer_length,
-                        "confidence": confidence
+                        "confidence": current_confidence
                     }
                 
-                # Clear buffer if confidence is good or we've reached max size
-                self.buffer = np.array([], dtype=np.float32)
+                # Update accumulated text and prepare result
+                self._update_accumulated_text(result, current_confidence)
                 
-                return {
-                    "type": "final",
-                    **result,
-                    "is_speaking": self.is_speaking,
-                    "confidence": confidence
-                }
+                # Clear buffer and previous result if no speech detected
+                if not self.is_speaking:
+                    self.buffer = np.array([], dtype=np.float32)
+                    self.last_result = None
+                    self.last_confidence = 0.0
+                
+                return self._prepare_final_result(result)
             
             # Return buffering status
             return {
@@ -283,6 +305,42 @@ class StreamingSession:
         except Exception as e:
             logger.error(f"Error processing chunk: {str(e)}")
             raise
+            
+    def _update_accumulated_text(self, result: Dict[str, Any], confidence: float) -> None:
+        """Update accumulated text based on new result and confidence."""
+        new_text = result.get("text", "").strip()
+        new_segments = result.get("segments", [])
+        
+        if confidence >= self.HIGH_CONFIDENCE_THRESHOLD:
+            # For high confidence results, directly update accumulated text
+            if new_text:
+                self.accumulated_text = (self.accumulated_text + " " + new_text).strip()
+                self.accumulated_segments.extend(new_segments)
+        else:
+            # For lower confidence results, only add if it's not redundant
+            if new_text and not self._is_redundant_text(new_text):
+                self.accumulated_text = (self.accumulated_text + " " + new_text).strip()
+                self.accumulated_segments.extend(new_segments)
+    
+    def _is_redundant_text(self, new_text: str) -> bool:
+        """Check if new text is redundant with existing accumulated text."""
+        new_words = set(new_text.lower().split())
+        accumulated_words = set(self.accumulated_text.lower().split())
+        overlap = len(new_words.intersection(accumulated_words))
+        
+        # Consider text redundant if more than 70% of words overlap
+        return overlap > 0 and overlap / len(new_words) > 0.7
+    
+    def _prepare_final_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare final result with accumulated text and segments."""
+        return {
+            "type": "final",
+            "text": self.accumulated_text,
+            "segments": self.accumulated_segments,
+            "language": result.get("language"),
+            "is_speaking": self.is_speaking,
+            "confidence": self.last_confidence
+        }
 
 # API Models
 class SourceConfig(BaseModel):
