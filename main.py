@@ -26,11 +26,11 @@ class AudioConfig:
     def __init__(self, 
                  sample_rate: int = 16000,
                  channels: int = 1,
-                 chunk_duration: float = 1.0,
+                 chunk_duration: float = 0.5,  # 0.5 seconds per chunk
                  vad_threshold: float = 0.3,
                  silence_duration: float = 0.3,
                  realtime_updates: bool = True,
-                 update_interval: float = 0.2):
+                 update_interval: float = 0.1):  # Reduced to handle shorter chunks
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_duration = chunk_duration
@@ -65,22 +65,39 @@ class WhisperProcessor:
             if np.abs(audio_data).max() > 1.0:
                 audio_data = audio_data / 32768.0
                 
-            # Get transcription
+            # Get transcription with additional parameters for better accuracy
             result = self.model.transcribe(
                 audio_data,
                 language=None,  # Auto-detect language
                 task="transcribe",
-                fp16=False if self.device == "cpu" else True
+                fp16=False if self.device == "cpu" else True,
+                best_of=5,  # Increase beam search paths
+                beam_size=5,  # Increase beam size
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=True,
+                temperature=0.0  # Reduce randomness in output
             )
             
-            # Format segments
+            # Format segments with confidence scores
             segments = []
             for segment in result["segments"]:
+                avg_logprob = segment.get("avg_logprob", -1)
+                no_speech_prob = segment.get("no_speech_prob", 0)
+                
+                # Calculate confidence score
+                confidence = 1.0 + avg_logprob  # Convert log prob to probability
+                confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+                confidence *= (1.0 - no_speech_prob)  # Reduce confidence if high no_speech_prob
+                
                 segments.append({
                     "text": segment["text"],
                     "start": segment["start"],
                     "end": segment["end"],
-                    "words": []  # Whisper doesn't provide word-level timestamps by default
+                    "confidence": confidence,
+                    "avg_logprob": avg_logprob,
+                    "no_speech_prob": no_speech_prob
                 })
             
             return {
@@ -122,18 +139,61 @@ class StreamingSession:
         self.buffer = np.array([], dtype=np.float32)
         self.is_speaking = False
         self.last_voice_timestamp = 0
-        self.min_samples_for_processing = int(self.config.sample_rate * 2)  # At least 2 seconds of audio
+        
+        # Configure buffer sizes
+        self.MIN_CHUNK_SIZE = int(0.5 * self.config.sample_rate)  # 0.5 seconds
+        self.OPTIMAL_CHUNK_SIZE = int(2.0 * self.config.sample_rate)  # 2 seconds for better accuracy
+        self.MAX_CHUNK_SIZE = int(10.0 * self.config.sample_rate)  # 10 seconds maximum
+        
+        # Confidence thresholds
+        self.MIN_CONFIDENCE_THRESHOLD = 0.6
+        self.HIGH_CONFIDENCE_THRESHOLD = 0.8
+        self.last_transcription = None
         
     def get_buffer_length(self) -> int:
-        """Get the current buffer length in samples."""
         return len(self.buffer) if self.buffer is not None else 0
+        
+    def calculate_confidence(self, result: Dict[str, Any]) -> float:
+        """Calculate confidence score based on multiple factors."""
+        try:
+            # Get average segment confidence if available
+            segment_confidences = [
+                segment.get("confidence", 0.0) 
+                for segment in result.get("segments", [])
+            ]
+            avg_confidence = sum(segment_confidences) / len(segment_confidences) if segment_confidences else 0.0
+            
+            # Get text length factor (longer text usually means better transcription)
+            text = result.get("text", "").strip()
+            text_length_factor = min(len(text.split()) / 3, 1.0)  # Normalize by expecting at least 3 words
+            
+            # Check for common low-confidence indicators
+            has_ellipsis = "..." in text
+            has_question_marks = "???" in text
+            has_repeated_chars = any(c * 3 in text for c in text)
+            
+            # Penalize confidence for low-quality indicators
+            penalties = sum([
+                0.2 if has_ellipsis else 0,
+                0.2 if has_question_marks else 0,
+                0.2 if has_repeated_chars else 0
+            ])
+            
+            # Combine factors
+            confidence = (avg_confidence * 0.7 + text_length_factor * 0.3) * (1.0 - penalties)
+            
+            return max(0.0, min(1.0, confidence))
+            
+        except Exception as e:
+            logger.error(f"Error calculating confidence: {str(e)}")
+            return 0.0
         
     async def process_chunk(self, chunk: bytes) -> Dict[str, Any]:
         """Process an incoming audio chunk."""
         try:
             # Handle end of stream
             if not chunk:
-                if self.get_buffer_length() > 0:
+                if self.get_buffer_length() >= self.MIN_CHUNK_SIZE:
                     result = await asyncio.get_event_loop().run_in_executor(
                         None,
                         self.processor.transcribe_sync,
@@ -150,21 +210,40 @@ class StreamingSession:
             # Convert bytes to numpy array and normalize
             audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             if np.abs(audio_data).max() > 1.0:
-                audio_data = audio_data / 32768.0  # Normalize to [-1, 1]
+                audio_data = audio_data / 32768.0
             
-            # Always accumulate the buffer
+            # Check for voice activity
+            has_speech = self.processor.check_voice_activity(audio_data)
+            current_time = time.time()
+            
+            if has_speech:
+                self.is_speaking = True
+                self.last_voice_timestamp = current_time
+            elif current_time - self.last_voice_timestamp > self.config.silence_duration:
+                self.is_speaking = False
+            
+            # Accumulate the buffer
             if self.buffer is None:
                 self.buffer = audio_data
             else:
                 self.buffer = np.concatenate([self.buffer, audio_data])
             
-            # Log buffer size for debugging
-            logger.debug(f"Current buffer size: {self.get_buffer_length()} samples")
+            current_buffer_length = self.get_buffer_length()
+            logger.debug(f"Current buffer size: {current_buffer_length} samples")
             
-            # Process buffer if it's large enough
-            if self.get_buffer_length() >= self.min_samples_for_processing:
-                logger.info(f"Processing buffer of size {self.get_buffer_length()}")
-                
+            # Check if we should process the buffer
+            should_process = (
+                # Process if buffer is too large
+                current_buffer_length >= self.MAX_CHUNK_SIZE or
+                # Process if we have optimal size and speech ended
+                (current_buffer_length >= self.OPTIMAL_CHUNK_SIZE and not self.is_speaking) or
+                # Process if we have minimum size and long silence
+                (current_buffer_length >= self.MIN_CHUNK_SIZE and 
+                 not self.is_speaking and 
+                 current_time - self.last_voice_timestamp > self.config.silence_duration * 2)
+            )
+            
+            if should_process:
                 # Process current buffer
                 result = await asyncio.get_event_loop().run_in_executor(
                     None,
@@ -172,49 +251,38 @@ class StreamingSession:
                     self.buffer
                 )
                 
-                # Clear buffer
+                confidence = self.calculate_confidence(result)
+                logger.info(f"Transcription confidence: {confidence:.2f}")
+                
+                # If confidence is too low and buffer isn't too large, continue accumulating
+                if confidence < self.MIN_CONFIDENCE_THRESHOLD and current_buffer_length < self.MAX_CHUNK_SIZE:
+                    return {
+                        "type": "buffering",
+                        "is_speaking": self.is_speaking,
+                        "buffer_size": current_buffer_length,
+                        "confidence": confidence
+                    }
+                
+                # Clear buffer if confidence is good or we've reached max size
                 self.buffer = np.array([], dtype=np.float32)
                 
                 return {
                     "type": "final",
                     **result,
-                    "is_speaking": True
+                    "is_speaking": self.is_speaking,
+                    "confidence": confidence
                 }
             
             # Return buffering status
             return {
                 "type": "buffering",
-                "is_speaking": True,
-                "buffer_size": self.get_buffer_length()
+                "is_speaking": self.is_speaking,
+                "buffer_size": current_buffer_length
             }
             
         except Exception as e:
             logger.error(f"Error processing chunk: {str(e)}")
             raise
-            
-    async def end_session(self) -> Optional[Dict[str, Any]]:
-        """End the streaming session and process any remaining audio."""
-        try:
-            if self.get_buffer_length() > 0:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.processor.transcribe_sync,
-                    self.buffer
-                )
-                self.buffer = np.array([], dtype=np.float32)
-                return {
-                    "type": "final",
-                    **result,
-                    "is_speaking": False
-                }
-        except Exception as e:
-            logger.error(f"Error ending session: {str(e)}")
-            return {
-                "type": "error",
-                "error": str(e),
-                "is_speaking": False
-            }
-        return None
 
 # API Models
 class SourceConfig(BaseModel):
@@ -368,19 +436,19 @@ async def websocket_endpoint(websocket: WebSocket):
     
     session = None
     try:
-        # Initialize streaming session with appropriate config
+        # Initialize streaming session with 0.5s chunk configuration
         config = AudioConfig(
-            chunk_duration=5.0,  # 5 seconds chunks
-            silence_duration=0.5,  # 0.5 seconds of silence to mark end of speech
+            chunk_duration=0.5,     # 0.5 seconds per chunk
+            silence_duration=0.3,    # 0.3 seconds of silence to mark end of speech
             realtime_updates=True,
-            update_interval=0.2
+            update_interval=0.1      # Reduced interval for more responsive updates
         )
         session = StreamingSession(whisper_processor, config)
         
         while True:
             try:
-                # Receive audio chunk with timeout
-                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=5.0)
+                # Receive audio chunk with shorter timeout
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=2.0)
                 
                 if not data or len(data) == 0:
                     logger.info("Received end of stream signal")
@@ -389,15 +457,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     if final_result:
                         await websocket.send_json(final_result)
                     break
-                    
+                
                 # Process chunk
                 try:
                     result = await session.process_chunk(data)
-                    
-                    print(f"Result: {result}")
-                    
                     if result:
                         await websocket.send_json(result)
+                        
+                        # Log final results for debugging
+                        if result.get("type") == "final":
+                            logger.info(f"Transcription: {result.get('text', '')}")
+                            
                 except Exception as e:
                     logger.error(f"Error processing chunk: {str(e)}")
                     await websocket.send_json({
